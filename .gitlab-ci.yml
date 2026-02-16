@@ -1,0 +1,688 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Smart MR pipeline: detect stack ➜ run targeted checks ➜ AI code review
+# ──────────────────────────────────────────────────────────────────────────────
+
+default:
+  tags: [instance-runner]
+
+stages: [detect, test, ai-review, report]
+
+# Multiline prompt als variable (voorkomt YAML parse-issues)
+variables:
+  GIT_DEPTH: "0"
+  REVIEW_PROMPT: |-
+    Je bent een senior reviewer. Bepaal eerst het type software (Node app/lib, WordPress plugin/tema, PHP app, Python, etc.).
+    Op basis daarvan:
+    - Controleer of de code compileert/buildt (voor zover af te leiden uit de diff).
+    - Check security (OWASP), performance, correctness, readability, backward-compat.
+    - Verwijs naar specifieke files/regels uit de diff.
+    - Geef concrete actiepunten en korte code-snippets ter verbetering.
+    - Eindig met: **Blockers**, **Non-blockers**, **Aanbevolen tests**.
+
+    Belangrijk:
+    - Beoordeel ALLEEN de code in de diff; negeer bestaande/legacy code buiten de diff.
+    - Geef GEEN Blockers of Non-blockers voor code die al vóór deze MR in de repository stond.
+    - Een probleem mag alleen een Blocker zijn als het direct voortkomt uit de wijzigingen in deze MR.
+    - Als iets al fout was maar niet aangepast is in deze MR: eventueel benoemen onder "Context / Verdere aandacht (niet voor deze MR)", maar nooit als Blocker/Non-blocker voor deze MR.
+
+    Belangrijk — omgaan met bestaande kwetsbaarheden en verbeteringen in deze MR:
+
+    - Beoordeel uitsluitend de wijzigingen in de diff; niet de complete repository.
+
+    - Als een kwetsbaar, slecht of onveilig patroon uit de oude code in deze MR wordt VERWIJDERD
+      → noteer dit als: "✅ Opgelost in deze MR" en geef GEEN blocker hierop.
+
+    - Als een fout patroon wordt VERWIJDERD én vervangen door een veiliger alternatief (bijv. sleutel gaat van hardcoded naar env)
+      → noteer dit als: "✅ Verbeterd in deze MR" en GEEN blocker.
+
+    - Als een fout patroon al bestond vóór deze MR en in deze MR NIET wordt aangeraakt
+      → maximaal opnemen onder een sectie "Context (niet voor deze MR)" maar NIET als blocker of non-blocker.
+
+    - Blockers en non-blockers mogen uitsluitend betrekking hebben op nieuw toegevoegde of gewijzigde regels in deze diff.
+
+    Schrijf op de allerlaatste regel enkel: DECISION: APPROVE  of  DECISION: NEEDS_CHANGES
+
+    --- DIFF (unified) ---
+
+# ── 1) DETECT ────────────────────────────────────────────────────────────────
+detect_stack:
+  stage: detect
+  image: alpine:3.23
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  script:
+    - apk add --no-cache git jq file
+    - |
+      stack="wordpress"
+      # WordPress Plugin/Tema detectie
+      if git ls-files '*.php' | grep -q .; then
+        # Controleer voor WordPress plugin headers
+        if git ls-files '*.php' | xargs -I{} sh -c "head -20 '{}' | grep -qi 'Plugin Name:' && echo hit" | grep -q hit; then
+          stack="wordpress,plugin"
+        # Controleer voor WordPress tema headers
+        elif git ls-files '*.php' | xargs -I{} sh -c "head -20 '{}' | grep -qi 'Theme Name:' && echo hit" | grep -q hit; then
+          stack="wordpress,theme"
+        else
+          stack="wordpress,php"
+        fi
+      else
+        stack="unknown"
+      fi
+      echo "Detected WordPress stack: $stack"
+      printf '%s' "{\"stacks\":\"$stack\"}" > stack.json
+  artifacts:
+    when: always
+    paths: [stack.json]
+    expire_in: 7 days
+
+# ── 2) TESTS PER STACK ───────────────────────────────────────────────────────
+
+
+# WordPress Plugin Tests
+test_wp_plugin:
+  stage: test
+  image: php:8.5-cli
+  needs: [detect_stack]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      exists:
+        - '*.php'
+  script:
+    - php -v
+    - apt-get update && apt-get install -y git unzip curl jq
+    - curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+    
+    # 1) WordPress Plugin Header Validation
+    - |
+      echo "🔍 Validating WordPress plugin headers..."
+      BASE="$CI_MERGE_REQUEST_DIFF_BASE_SHA"
+      HEAD="$CI_COMMIT_SHA"
+      git fetch --no-tags origin "$BASE" "$HEAD"
+      CHANGED_PHP="$(git diff --name-only "$BASE...$HEAD" | grep -E '\.php$' || true)"
+      
+      if [ -n "$CHANGED_PHP" ]; then
+        echo "Checking PHP syntax for: $CHANGED_PHP"
+        echo "$CHANGED_PHP" | xargs -r -I{} sh -c 'echo "Checking {}" && php -l "{}"' || (echo "❌ PHP syntax errors found" && exit 1)
+        echo "✅ All PHP files have valid syntax"
+        
+        # Simplified PHP Static Analysis
+        echo "🔍 Running PHP static analysis..."
+        CRITICAL_ERRORS=0
+        WARNINGS=0
+        
+        for file in $CHANGED_PHP; do
+          if [ -f "$file" ]; then
+            echo "Analyzing: $file"
+            
+            # 1. Check for wp_debug_log (critical error) - but ignore function_exists checks
+            if grep -q "wp_debug_log" "$file" 2>/dev/null; then
+              # Check if it's properly wrapped in function_exists
+              if ! grep -q "function_exists.*wp_debug_log" "$file" 2>/dev/null; then
+                echo "❌ Critical: $file uses wp_debug_log() without proper function_exists check"
+                CRITICAL_ERRORS=$((CRITICAL_ERRORS + 1))
+              else
+                echo "✅ Good: $file uses wp_debug_log() with proper function_exists check"
+              fi
+            fi
+            
+            # 2. Check for deprecated functions
+            if grep -qE '\bmysql_query\s*\(' "$file" 2>/dev/null; then
+              echo "❌ Critical: $file uses deprecated mysql_query()"
+              CRITICAL_ERRORS=$((CRITICAL_ERRORS + 1))
+            fi
+            
+            # 3. Check for dangerous functions
+            if grep -qE '\beval\s*\(' "$file" 2>/dev/null; then
+              echo "❌ Critical: $file uses dangerous eval() function"
+              CRITICAL_ERRORS=$((CRITICAL_ERRORS + 1))
+            fi
+            
+            # 4. Check for SQL injection risks
+            if grep -q "mysql_query" "$file" 2>/dev/null; then
+              echo "❌ Critical: $file uses deprecated mysql_query()"
+              CRITICAL_ERRORS=$((CRITICAL_ERRORS + 1))
+            fi
+            
+            # 5. Check for XSS vulnerabilities
+            if grep -q "echo.*\$_GET" "$file" 2>/dev/null; then
+              echo "⚠️ Warning: $file may have XSS vulnerabilities"
+              WARNINGS=$((WARNINGS + 1))
+            fi
+          fi
+        done
+        
+        # WordPress-specific best practices check
+        echo ""
+        echo "🔍 Checking WordPress best practices..."
+        WP_ISSUES=0
+        
+        for file in $CHANGED_PHP; do
+          if [ -f "$file" ]; then
+            # Check for proper WordPress sanitization
+            if grep -q "sanitize_" "$file" 2>/dev/null; then
+              echo "✅ Good: $file uses WordPress sanitization"
+            fi
+            
+            # Check for proper WordPress nonces
+            if grep -q "wp_nonce_field" "$file" 2>/dev/null; then
+              echo "✅ Good: $file uses WordPress nonces"
+            fi
+          fi
+        done
+        
+        # Report results
+        echo ""
+        echo "📊 Static Analysis Results:"
+        echo "   Critical Errors: $CRITICAL_ERRORS"
+        echo "   Warnings: $WARNINGS"
+        echo "   WordPress Issues: $WP_ISSUES"
+        echo ""
+        
+        if [ $CRITICAL_ERRORS -gt 0 ]; then
+          echo "❌ BLOCKING MERGE: Found $CRITICAL_ERRORS critical errors that must be fixed"
+          exit 1
+        elif [ $WARNINGS -gt 0 ] || [ $WP_ISSUES -gt 0 ]; then
+          echo "⚠️ Found $WARNINGS warnings and $WP_ISSUES WordPress issues (non-blocking but should be reviewed)"
+        else
+          echo "✅ No critical errors, warnings, or WordPress issues found"
+        fi
+      else
+        echo "ℹ️ No changed PHP files to check"
+      fi
+      
+      # Check for main plugin file
+      MAIN_PLUGIN_FILE=""
+      for file in *.php; do
+        if [ -f "$file" ] && head -20 "$file" | grep -qi "Plugin Name:"; then
+          MAIN_PLUGIN_FILE="$file"
+          break
+        fi
+      done
+      
+      if [ -z "$MAIN_PLUGIN_FILE" ]; then
+        echo "❌ No main plugin file found with 'Plugin Name:' header"
+        exit 1
+      fi
+      
+      echo "✅ Main plugin file found: $MAIN_PLUGIN_FILE"
+      
+      # Validate plugin headers
+      REQUIRED_HEADERS=("Plugin Name" "Version" "Description" "Author")
+      for header in "${REQUIRED_HEADERS[@]}"; do
+        if ! head -20 "$MAIN_PLUGIN_FILE" | grep -qi "^[[:space:]]*\\* $header:"; then
+          echo "❌ Missing required header: $header"
+          exit 1
+        fi
+      done
+      echo "✅ All required plugin headers present"
+    
+    # 2) WordPress Coding Standards Check
+    - |
+      echo "🔍 Running WordPress Coding Standards check..."
+      if [ -f composer.json ]; then
+        composer install --no-interaction --no-progress || echo "ℹ️ Composer install failed, continuing..."
+      fi
+      
+      # Install WordPress Coding Standards if not present
+      if [ ! -d "vendor/wp-coding-standards/wpcs" ]; then
+        composer require --dev squizlabs/php_codesniffer wp-coding-standards/wpcs:dev-master --no-interaction || echo "ℹ️ WPCS install failed, continuing..."
+      fi
+      
+      # Run PHPCS if available
+      if [ -x vendor/bin/phpcs ]; then
+        echo "Running PHPCS on changed files..."
+        if [ -n "$CHANGED_PHP" ]; then
+          echo "$CHANGED_PHP" | xargs -r vendor/bin/phpcs --standard=WordPress --report=json --report-file=phpcs-report.json || echo "⚠️ PHPCS found issues (see phpcs-report.json)"
+        else
+          vendor/bin/phpcs --standard=WordPress --report=json --report-file=phpcs-report.json *.php || echo "⚠️ PHPCS found issues (see phpcs-report.json)"
+        fi
+      else
+        echo "ℹ️ PHPCS not available, skipping coding standards check"
+      fi
+    
+    # 3) Security Scan
+    - |
+      echo "🔍 Running basic security checks..."
+      SECURITY_ISSUES=0
+      
+      # Check for common security issues in changed files
+      if [ -n "$CHANGED_PHP" ]; then
+        for file in $CHANGED_PHP; do
+          if [ -f "$file" ]; then
+            # Enhanced check for direct file access without ABSPATH check
+            if grep -q "<?php" "$file"; then
+              # Check if file has proper WordPress security headers
+              if ! grep -q "defined.*ABSPATH.*exit" "$file" && ! grep -q "!.*defined.*ABSPATH" "$file"; then
+                # Additional check: look for WordPress-specific patterns that should have ABSPATH
+                if grep -q "wp_\|get_option\|add_action\|add_filter" "$file"; then
+                  echo "⚠️ Security: $file contains WordPress functions but may lack ABSPATH check"
+                  SECURITY_ISSUES=$((SECURITY_ISSUES + 1))
+                fi
+              fi
+            fi
+            
+            # Check for SQL injection risks (basic check)
+            if grep -q "mysql_query\|mysqli_query" "$file"; then
+              echo "⚠️ Security: $file uses deprecated MySQL functions"
+              SECURITY_ISSUES=$((SECURITY_ISSUES + 1))
+            fi
+            
+            # Check for eval() usage
+            if grep -q "eval(" "$file"; then
+              echo "❌ Security: $file contains eval() - high risk"
+              SECURITY_ISSUES=$((SECURITY_ISSUES + 1))
+            fi
+          fi
+        done
+      fi
+      
+      if [ $SECURITY_ISSUES -gt 0 ]; then
+        echo "⚠️ Found $SECURITY_ISSUES potential security issues"
+      else
+        echo "✅ No obvious security issues found"
+      fi
+    
+    # 4) WordPress Best Practices Check
+    - |
+      echo "🔍 Checking WordPress best practices..."
+      BEST_PRACTICES_ISSUES=0
+      
+      if [ -n "$CHANGED_PHP" ]; then
+        for file in $CHANGED_PHP; do
+          if [ -f "$file" ]; then
+            # Check for proper WordPress hooks usage
+            if grep -q "add_action\|add_filter" "$file" && ! grep -q "remove_action\|remove_filter" "$file"; then
+              echo "ℹ️ Best Practice: $file uses WordPress hooks (good)"
+            fi
+            
+            # Check for proper sanitization
+            if grep -q "esc_html\|esc_attr\|sanitize_" "$file"; then
+              echo "✅ Best Practice: $file uses proper sanitization"
+            fi
+            
+            # Check for nonce usage in forms
+            if grep -q "wp_nonce_field\|wp_create_nonce" "$file"; then
+              echo "✅ Best Practice: $file uses nonces for security"
+            fi
+          fi
+        done
+      fi
+    
+    # 5) Performance Check
+    - |
+      echo "🔍 Checking for performance issues..."
+      if [ -n "$CHANGED_PHP" ]; then
+        for file in $CHANGED_PHP; do
+          if [ -f "$file" ]; then
+            # Check for database queries in loops
+            if grep -q "get_option\|get_post_meta\|get_user_meta" "$file" && grep -q "foreach\|for\|while" "$file"; then
+              echo "⚠️ Performance: $file may have database queries in loops"
+            fi
+            
+            # Check for proper caching usage
+            if grep -q "set_transient\|get_transient\|wp_cache" "$file"; then
+              echo "✅ Performance: $file uses caching"
+            fi
+          fi
+        done
+      fi
+    
+    # 6) Generate Test Report
+    - |
+      echo "📊 Generating WordPress Plugin Test Report..."
+      {
+        echo "# WordPress Plugin Test Report"
+        echo ""
+        echo "## Plugin Information"
+        echo "- **Main Plugin File**: $MAIN_PLUGIN_FILE"
+        echo "- **Changed Files**: $CHANGED_PHP"
+        echo ""
+        echo "## Test Results"
+        echo "- ✅ PHP Syntax: All files valid"
+        echo "- ✅ Plugin Headers: All required headers present"
+        echo "- ✅ Security Scan: Basic checks completed"
+        echo "- ✅ Best Practices: WordPress standards checked"
+        echo "- ✅ Performance: Basic performance checks completed"
+        echo ""
+        echo "## Recommendations"
+        echo "- Ensure all user inputs are properly sanitized"
+        echo "- Use WordPress hooks and filters appropriately"
+        echo "- Implement proper caching for database queries"
+        echo "- Follow WordPress Coding Standards"
+        echo ""
+        echo "## Files Checked"
+        echo "$CHANGED_PHP" | sed 's/^/- /'
+      } > wp-plugin-test-report.md
+      echo "✅ WordPress Plugin test report generated"
+  
+  artifacts:
+    when: always
+    paths: 
+      - wp-plugin-test-report.md
+      - phpcs-report.json
+    expire_in: 7 days
+
+
+# ── 3) AI REVIEW (Cursor headless + OpenAI fallback) ─────────────────────────
+ai_review:
+  stage: ai-review
+  image: node:25
+  needs: [detect_stack]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  before_script:
+    - node --version
+    - apt-get update && apt-get install -y curl jq git ca-certificates
+    - |
+      if [ -z "${GITLAB_TOKEN:-}" ]; then
+        echo "❌ GITLAB_TOKEN ontbreekt (PAT met api-scope)."; exit 1
+      fi
+    - |
+      STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+        --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+        "https://${CI_SERVER_HOST}/api/v4/projects/${CI_PROJECT_ID}")
+      [ "$STATUS" = "200" ] || { echo "❌ GitLab API test HTTP $STATUS"; exit 1; }
+  script:
+    # 1) Diff + stack met MR-SHA
+    - BASE="$CI_MERGE_REQUEST_DIFF_BASE_SHA"
+    - HEAD="$CI_COMMIT_SHA"
+    - git fetch --no-tags origin "$BASE" "$HEAD"
+    - git diff --unified=0 "$BASE...$HEAD" > diff.patch
+    - STACK=$(jq -r '.stacks' stack.json 2>/dev/null || echo "unknown")
+    - |
+      if [ ! -s diff.patch ]; then
+        echo "ℹ️ Geen wijzigingen gedetecteerd; sla review over."
+        exit 0
+      fi
+
+    # 2) Cursor installeren en PATH fixen
+    - |
+      set +e
+      bash -lc 'curl -fsS https://cursor.com/install | bash'
+      rc=$?
+      set -e
+      export PATH="$HOME/.local/bin:$PATH"
+      if command -v cursor-agent >/dev/null 2>&1; then
+        echo "✅ cursor-agent actief"
+        USE_CURSOR=1
+      else
+        echo "⚠️ Cursor installer (rc=$rc) niet bruikbaar → fallback OpenAI"
+        USE_CURSOR=0
+      fi
+
+    # 3) Altijd alvast de OpenAI fallback file genereren (heredoc op kolom 0!)
+    - |
+      cat > review.js <<'EOF'
+      import fs from 'fs';
+      const key = process.env.OPENAI_API_KEY;
+      const diff = fs.readFileSync('diff.patch','utf8');
+      const stack = process.env.STACK ?? 'unknown';
+      const MAX=150000; const d = diff.length>MAX ? diff.slice(0,MAX) : diff;
+      const sys = `
+      You are a senior code reviewer and build cop.
+      1) First infer the project type (Node app/lib, WordPress plugin/theme, PHP app, Python package/app, etc.) using filenames and diff.
+      2) Based on the type, assess risks: security (OWASP), performance, correctness, readability, backward-compat.
+      3) If tests or standard commands are likely (npm test, phpunit, pytest), mention exactly what to run.
+      4) Return Markdown with sections: Detected Stack, Blockers, Non-blockers, Suggested Tests, Code Fix Snippets.
+      Reference files and line ranges from the diff where possible.
+      `;
+      const usr = `Stack hints from detector: ${stack}\n\nUnified diff:\n${d}`;
+      const body = { model:"gpt-4o-mini", temperature:0.2,
+        messages:[{role:"system",content:sys},{role:"user",content:usr}] };
+      const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+        method:"POST", headers:{"Authorization":`Bearer ${key}`,"Content-Type":"application/json"},
+        body: JSON.stringify(body)
+      });
+      if (!resp.ok) { console.error("OpenAI error:", await resp.text()); process.exit(1); }
+      const json = await resp.json();
+      const content = json.choices?.[0]?.message?.content ?? "";
+      fs.writeFileSync("review.md", content || "AI review unavailable.");
+      console.log("✅ Review generated");
+      EOF
+
+    # 4) Of Cursor draaien, of fallback uitvoeren
+    - |
+      if [ "$USE_CURSOR" = "1" ] && [ -n "${CURSOR_API_KEY:-}" ]; then
+        # Promptbestand opbouwen vanuit variabele + diff
+        printf "%s\n" "$REVIEW_PROMPT" > prompt.txt
+        sed -e 's/`/\\`/g' diff.patch >> prompt.txt
+        cursor-agent -p --output-format text "$(cat prompt.txt)" > review.md || {
+          echo '❌ cursor-agent faalde'; exit 1;
+        }
+      else
+        export OPENAI_API_KEY="${OPENAI_API_KEY:-$CURSOR_API_KEY}"
+        STACK="$STACK" node review.js
+      fi
+
+    # 5) MR-comment plaatsen
+    - >
+      curl --fail --header "PRIVATE-TOKEN: $GITLAB_TOKEN"
+      --data-urlencode "body=$(printf '### 🤖 AI Review\n\nDetected stacks: `%s`\n\n%s' "$STACK" "$(cat review.md)")"
+      "https://${CI_SERVER_HOST}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}/notes"
+  artifacts:
+    when: always
+    paths: [review.md, diff.patch, stack.json]
+    expire_in: 7 days
+
+# ── 4) AI Verdict (CE-vriendelijk) ────────────────────────────────────────────
+ai_verdict:
+  stage: report
+  image: alpine:3.23
+  needs:
+    - job: ai_review
+      artifacts: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: on_success
+  before_script:
+    - apk add --no-cache curl jq
+    - |
+      if [ -z "${GITLAB_TOKEN:-}" ]; then
+        echo "ℹ️ GITLAB_TOKEN ontbreekt; sla statuswijzigingen over (CE-modus)."
+      fi
+  script:
+    # 1) Beslissing uit review.md lezen
+    - |
+      echo "🔍 Zoeken naar review.md artifact..."
+      ls -la review.md || echo "ℹ️ review.md niet gevonden in huidige directory"
+      if [ ! -f review.md ]; then
+        echo "ℹ️ review.md ontbreekt; niets te doen."
+        exit 0
+      fi
+      echo "✅ review.md gevonden, analyseren..."
+      echo "🔍 Zoeken naar DECISION in review.md..."
+      DECISION=$(grep -i 'DECISION:' review.md | head -1 | sed 's/.*DECISION:\s*//i' | tr -d ' \t\r\n' | tr '[:lower:]' '[:upper:]')
+      echo "🔍 Gevonden DECISION: '$DECISION'"
+      if [ -z "$DECISION" ] || [ "$DECISION" != "APPROVE" ] && [ "$DECISION" != "NEEDS_CHANGES" ]; then
+        echo "ℹ️ Geen geldige DECISION gevonden in review.md; niets te wijzigen."
+        echo "🔍 Eerste 10 regels van review.md:"
+        head -10 review.md
+        exit 0
+      fi
+      echo "ℹ️ AI verdict: $DECISION"
+
+    # 2) Als we geen token hebben, alleen loggen (niet falen)
+    - |
+      if [ -z "${GITLAB_TOKEN:-}" ]; then
+        echo "ℹ️ Geen GITLAB_TOKEN → kan MR niet aanpassen via API. Stop zonder fouten."
+        exit 0
+      fi
+
+    # 3) Huidige MR-info ophalen
+    - |
+      MR_API="https://${CI_SERVER_HOST}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}"
+      MR_JSON=$(curl -sS --header "PRIVATE-TOKEN: $GITLAB_TOKEN" "$MR_API")
+      TITLE=$(echo "$MR_JSON" | jq -r '.title // empty')
+      LABELS_CSV=$(echo "$MR_JSON" | jq -r '[.labels[]] | join(",")')
+      [ "$LABELS_CSV" = "null" ] && LABELS_CSV=""
+
+    # 4) Hulpfuncties: labels beheren (case-insensitief, zonder doublures)
+    - |
+      add_label () {
+        local csv="$1"; local add="$2"
+        echo "$csv" | awk -v add="$add" -F, '
+          BEGIN{IGNORECASE=1}
+          {
+            found=0;
+            for(i=1;i<=NF;i++){ gsub(/^ +| +$/,"",$i); if(tolower($i)==tolower(add)) found=1 }
+            if(found){ print $0 }
+            else if(length($0)==0){ print add }
+            else { print $0","add }
+          }'
+      }
+      
+      remove_label () {
+        local csv="$1"; local rem="$2"
+        echo "$csv" | awk -v rem="$rem" -F, '
+          BEGIN{IGNORECASE=1}
+          {
+            out="";
+            for(i=1;i<=NF;i++){
+              gsub(/^ +| +$/,"",$i);
+              if(tolower($i)!=tolower(rem)){ out = (out==""?$i:out","$i) }
+            }
+            print out
+          }'
+      }
+
+    # 5) Voer CE-vriendelijke acties uit met label synchronisatie
+    - |
+      if [ "$DECISION" = "APPROVE" ]; then
+        echo "✅ APPROVE: verwijder Draft: uit titel (indien aanwezig) en synchroniseer labels."
+        NEW_TITLE=$(echo "$TITLE" | sed -E 's/^(Draft:|WIP:)\s*//I')
+        if [ -n "$NEW_TITLE" ] && [ "$NEW_TITLE" != "$TITLE" ]; then
+          curl -sS -X PUT --fail --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+            --data-urlencode "title=${NEW_TITLE}" "$MR_API" >/dev/null || true
+        fi
+        
+        # Verwijder needs-changes label en voeg ai-approved toe
+        echo "🔍 Huidige labels: $LABELS_CSV"
+        NEW_LABELS=$(remove_label "$LABELS_CSV" "needs-changes")
+        echo "🔍 Na verwijderen needs-changes: $NEW_LABELS"
+        NEW_LABELS=$(add_label "$NEW_LABELS" "ai-approved")
+        echo "🔍 Nieuwe labels: $NEW_LABELS"
+        
+        # Controleer of labels bestaan, maak ze aan indien nodig
+        echo "🏷️ Checking if labels exist..."
+        LABELS_API="https://${CI_SERVER_HOST}/api/v4/projects/${CI_PROJECT_ID}/labels"
+        EXISTING_LABELS=$(curl -sS --header "PRIVATE-TOKEN: $GITLAB_TOKEN" "$LABELS_API" | jq -r '.[].name' | tr '\n' ',' | sed 's/,$//')
+        echo "🔍 Existing project labels: $EXISTING_LABELS"
+        
+        # Maak ai-approved label aan indien het niet bestaat
+        if ! echo "$EXISTING_LABELS" | grep -qi "ai-approved"; then
+          echo "🏷️ Creating ai-approved label..."
+          curl -sS -X POST --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+            --data-urlencode "name=ai-approved" \
+            --data-urlencode "color=#28a745" \
+            --data-urlencode "description=AI has approved this merge request" \
+            "$LABELS_API" >/dev/null || true
+        fi
+        
+        # Maak needs-changes label aan indien het niet bestaat
+        if ! echo "$EXISTING_LABELS" | grep -qi "needs-changes"; then
+          echo "🏷️ Creating needs-changes label..."
+          curl -sS -X POST --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+            --data-urlencode "name=needs-changes" \
+            --data-urlencode "color=#dc3545" \
+            --data-urlencode "description=AI requires changes before approval" \
+            "$LABELS_API" >/dev/null || true
+        fi
+        
+        echo "🏷️ Updating labels via API..."
+        echo "🔗 API URL: $MR_API"
+        echo "📝 Labels to set: $NEW_LABELS"
+        API_RESPONSE=$(curl -sS -X PUT --fail --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+          --data-urlencode "labels=${NEW_LABELS}" "$MR_API" 2>&1)
+        if [ $? -eq 0 ]; then
+          echo "✅ Labels update successful"
+        else
+          echo "❌ Labels update failed: $API_RESPONSE"
+        fi
+        # Optioneel: korte note
+        curl -sS --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+          --data-urlencode "body=✅ AI verdict: APPROVE" \
+          "$MR_API/notes" >/dev/null || true
+      else
+        echo "⛔ NEEDS_CHANGES: zet MR naar draft en synchroniseer labels."
+        # Zet MR naar draft door Draft: toe te voegen aan titel
+        if ! echo "$TITLE" | grep -qE "^(Draft:|WIP:)\s*"; then
+          NEW_TITLE="Draft: $TITLE"
+          curl -sS -X PUT --fail --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+            --data-urlencode "title=${NEW_TITLE}" "$MR_API" >/dev/null || true
+          echo "📝 MR titel aangepast naar: $NEW_TITLE"
+        fi
+        # Verwijder ai-approved label en voeg needs-changes toe
+        echo "🔍 Huidige labels: $LABELS_CSV"
+        NEW_LABELS=$(remove_label "$LABELS_CSV" "ai-approved")
+        echo "🔍 Na verwijderen ai-approved: $NEW_LABELS"
+        NEW_LABELS=$(add_label "$NEW_LABELS" "needs-changes")
+        echo "🔍 Nieuwe labels: $NEW_LABELS"
+        
+        # Controleer of labels bestaan, maak ze aan indien nodig
+        echo "🏷️ Checking if labels exist..."
+        LABELS_API="https://${CI_SERVER_HOST}/api/v4/projects/${CI_PROJECT_ID}/labels"
+        EXISTING_LABELS=$(curl -sS --header "PRIVATE-TOKEN: $GITLAB_TOKEN" "$LABELS_API" | jq -r '.[].name' | tr '\n' ',' | sed 's/,$//')
+        echo "🔍 Existing project labels: $EXISTING_LABELS"
+        
+        # Maak ai-approved label aan indien het niet bestaat
+        if ! echo "$EXISTING_LABELS" | grep -qi "ai-approved"; then
+          echo "🏷️ Creating ai-approved label..."
+          curl -sS -X POST --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+            --data-urlencode "name=ai-approved" \
+            --data-urlencode "color=#28a745" \
+            --data-urlencode "description=AI has approved this merge request" \
+            "$LABELS_API" >/dev/null || true
+        fi
+        
+        # Maak needs-changes label aan indien het niet bestaat
+        if ! echo "$EXISTING_LABELS" | grep -qi "needs-changes"; then
+          echo "🏷️ Creating needs-changes label..."
+          curl -sS -X POST --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+            --data-urlencode "name=needs-changes" \
+            --data-urlencode "color=#dc3545" \
+            --data-urlencode "description=AI requires changes before approval" \
+            "$LABELS_API" >/dev/null || true
+        fi
+        
+        echo "🏷️ Updating labels via API..."
+        echo "🔗 API URL: $MR_API"
+        echo "📝 Labels to set: $NEW_LABELS"
+        API_RESPONSE=$(curl -sS -X PUT --fail --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+          --data-urlencode "labels=${NEW_LABELS}" "$MR_API" 2>&1)
+        if [ $? -eq 0 ]; then
+          echo "✅ Labels update successful"
+        else
+          echo "❌ Labels update failed: $API_RESPONSE"
+        fi
+        # Create comment body with proper formatting
+        COMMENT_BODY="❌ **AI Review: NEEDS_CHANGES**\n\n🔒 **MR is naar Draft gezet**\n\n⚠️ **Kritieke issues gevonden:**\n- 🔴 Blockers moeten worden opgelost\n- 📝 Zie details in de AI-review (artifact review.md)\n- 🏷️ Label \`needs-changes\` toegevoegd\n\n**Volgende stappen:**\n1. Los de blockers op\n2. Verwijder \`Draft:\` uit de titel\n3. MR wordt automatisch opnieuw beoordeeld"
+        
+        curl -sS --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+          --data-urlencode "body=${COMMENT_BODY}" \
+          "$MR_API/notes" >/dev/null || true
+      fi
+
+  artifacts:
+    when: always
+    paths: [review.md]
+    expire_in: 7 days
+
+# ── 5) Compacte eindrapportage (optioneel) ───────────────────────────────────
+report_summary:
+  stage: report
+  image: node:25
+  needs:
+    - job: detect_stack
+    - job: ai_review
+    - job: test_wp_plugin
+      optional: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  script:
+    - |
+      echo "WordPress Plugin Pipeline Summary:"
+      echo "Zie job logs & artifacts per stack-job"
+      echo "AI-review staat in review.md (artifact) en als MR-comment"
+      echo "WordPress Plugin tests: wp-plugin-test-report.md (artifact)"
+      echo "PHPCS rapport: phpcs-report.json (artifact)"
+      echo "Pipeline voltooid - alle WordPress plugin checks uitgevoerd"

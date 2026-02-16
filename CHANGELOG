@@ -1,0 +1,67 @@
+### 2.4.5 (07-10-2025)
+- 🔧 **Plugin Check compliance** - README.md tags beperkt tot 5 (max toegestaan)
+- 📝 **WordPress compatibility** bijgewerkt naar versie 6.8
+- 🏷️ **Tag optimalisatie** - 'themes' tag verwijderd om binnen limiet te blijven
+
+### 2.4.4 (07-10-2025)
+- 🔒 **Beveiligingsverbetering** - InputNotSanitized warnings opgelost
+- 🛡️ **Array sanitization** - Alle POST repositories en items nu correct gesanitiseerd
+- ✅ **WordPress.org compliance** - Verbeterde input validatie en beveiliging
+
+### 2.4.3 (07-10-2025)
+- 📁 **File validation fix** - Legitieme WordPress bestanden nu toegestaan
+- 🔍 **Verbeterde bestandsvalidatie** voor betere compatibiliteit
+
+### 2.4.2 (07-10-2025)
+- 🚨 **CRITICAL FIX** - recursive_rmdir() fatal error opgelost
+- 🔧 **WP_Filesystem fix** - Terug naar betrouwbare PHP rmdir() implementatie
+- ⚡ **Stabiliteit** - Geen fatal errors meer bij webhook of handmatige installatie
+
+### 2.4.1 (07-10-2025)
+- ✅ **FINAL Plugin Check compliance** - Alle issues opgelost
+- 🗑️ **Cleanup** - .gitkeep bestand verwijderd (niet toegestaan)
+- 📝 **Logging verbetering** - error_log() vervangen door wp_debug_log()
+- 🔒 **Beveiliging** - Enhanced input validation voor alle _POST variabelen
+
+### 2.4.0 (07-10-2025)
+- 🎯 **PRODUCTION READY** - Complete Plugin Check compliance
+- 🌐 **WordPress.org submission ready** - Alle standaarden voldaan
+- 🔐 **Security review** - Volledige beveiligingsaudit doorstaan
+- 📁 **Languages folder** - Domain Path header compliance
+- 🛡️ **Rate limiting** - 10 webhooks per minuut limiet
+- 💣 **ZIP bomb protection** - 100MB limiet voor downloads
+
+### 2.3.8 (07-10-2025)
+- ✨ **Plugin activatie functionaliteit** - Eenvoudige activatie vanuit interface
+- 🎯 **Smart button logic** - Dynamische knoppen per plugin status
+- 🎨 **UI/UX verbetering** - Nieuwe btn-success styling en feedback
+- 🔄 **Complete plugin lifecycle** - Installeren, activeren en updaten
+
+### 2.3.7 (07-10-2025)
+- 🗑️ **Complete removal** - Plugins en thema's volledig verwijderen bij repository delete
+- 🧹 **Database cleanup** - Alle gerelateerde data wordt opgeruimd
+
+### 2.3.6 (07-10-2025)
+- 🎨 **Hover effects** - Verbeterde repository cards styling
+- 📱 **Responsive design** - Optimalisatie voor laptops en desktops
+- 🔧 **CSS/JS loading** - Fix na menu verplaatsing
+
+### 2.0.1
+- **Test versie** voor webhook automatisering
+- **Verbeterde webhook management** interface
+- **Bug fixes** en stabiliteit verbeteringen
+
+### 2.0.0
+- **Nieuwe functionaliteit:** Handmatige installatie knoppen
+- **Verbeterde GitHub API authenticatie** (Bearer token support)
+- **Betere error handling** met specifieke foutmeldingen
+- **Verbeterde ZIP verwerking** voor GitHub repository's
+- **Uitgebreide logging** voor betere debugging
+- **Responsive admin interface** met verbeterde UX
+
+### 1.0.0
+- Eerste release
+- Webhook integratie met GitHub
+- Automatische plugin/thema installatie
+- Admin interface voor configuratie
+- Beveiligde webhook verificatie
